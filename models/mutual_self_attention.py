@@ -4,10 +4,10 @@ from typing import Any, Dict, Optional
 import torch
 from einops import rearrange
 
-from models.attention import TemporalBasicTransformerBlock
-
-from .attention import BasicTransformerBlock
-
+from champ.models.attention import (
+    BasicTransformerBlock,
+    TemporalBasicTransformerBlock
+)
 
 def torch_dfs(model: torch.nn.Module):
     result = [model]

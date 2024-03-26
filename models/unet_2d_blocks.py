@@ -12,7 +12,7 @@ from diffusers.utils import is_torch_version, logging
 from diffusers.utils.torch_utils import apply_freeu
 from torch import nn
 
-from .transformer_2d import Transformer2DModel
+from champ.models.transformer_2d import Transformer2DModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 

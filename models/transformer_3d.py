@@ -9,7 +9,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from einops import rearrange, repeat
 from torch import nn
 
-from .attention import TemporalBasicTransformerBlock
+from champ.models.attention import TemporalBasicTransformerBlock
 
 
 @dataclass

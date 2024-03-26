@@ -6,6 +6,8 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 import torch
+from PIL import Image
+
 from diffusers import DiffusionPipeline
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import (
@@ -22,9 +24,9 @@ from einops import rearrange
 from tqdm import tqdm
 from transformers import CLIPImageProcessor
 
-from models.mutual_self_attention import ReferenceAttentionControl
-from pipelines.context import get_context_scheduler
-from pipelines.pipe_utils import get_tensor_interpolation_method
+from champ.models.mutual_self_attention import ReferenceAttentionControl
+from champ.pipelines.context import get_context_scheduler
+from champ.pipelines.pipe_utils import get_tensor_interpolation_method
 
 
 @dataclass
@@ -340,6 +342,32 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
 
         return new_latents
 
+    def images_from_video(
+        self,
+        video: torch.Tensor,
+        rescale: bool=False
+    ) -> List[Image.Image]:
+        """
+        Convert a video tensor to a list of PIL images
+        """
+        import numpy as np
+        import torchvision
+        from einops import rearrange
+        video = rearrange(video, "b c t h w -> t b c h w")
+        height, width = video.shape[-2:]
+        outputs = []
+
+        for x in video:
+            x = torchvision.utils.make_grid(x, nrow=1)  # (c h w)
+            x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)  # (h w c)
+            if rescale:
+                x = (x + 1.0) / 2.0  # -1,1 -> 0,1
+            x = (x * 255).numpy().astype(np.uint8)
+            x = Image.fromarray(x)
+            outputs.append(x)
+
+        return outputs
+
     @torch.no_grad()
     def __call__(
         self,
@@ -354,7 +382,7 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
         num_images_per_prompt=1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        output_type: Optional[str] = "tensor",
+        output_type: Optional[str]="pil",
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
@@ -581,14 +609,16 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
 
         if interpolation_factor > 0:
             latents = self.interpolate_latents(latents, interpolation_factor, device)
+
         # Post-processing
         images = self.decode_latents(latents)  # (b, c, f, h, w)
 
-        # Convert to tensor
         if output_type == "tensor":
             images = torch.from_numpy(images)
+        elif output_type == "pil":
+            images = self.images_from_video(torch.from_numpy(images))
 
         if not return_dict:
             return images
-        
+
         return MultiGuidance2VideoPipelineOutput(videos=images)

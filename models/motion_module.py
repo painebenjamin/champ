@@ -38,7 +38,7 @@ def get_motion_module(in_channels, motion_module_type: str, motion_module_kwargs
             **motion_module_kwargs,
         )
     else:
-        raise ValueError
+        raise ValueError(f"Unknown motion_module_type: {motion_module_type}")
 
 
 class VanillaTemporalModule(nn.Module):

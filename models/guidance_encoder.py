@@ -1,20 +1,22 @@
 from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 
+from diffusers.configuration_utils import ConfigMixin
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput
 from dataclasses import dataclass
 
-from models.motion_module import zero_module
-from models.resnet import InflatedConv3d, InflatedGroupNorm
-from models.attention import TemporalBasicTransformerBlock
-from models.transformer_3d import Transformer3DModel
+from champ.models.motion_module import zero_module
+from champ.models.resnet import InflatedConv3d, InflatedGroupNorm
+from champ.models.attention import TemporalBasicTransformerBlock
+from champ.models.transformer_3d import Transformer3DModel
     
     
-class GuidanceEncoder(ModelMixin):
+class GuidanceEncoder(ModelMixin, ConfigMixin):
     def __init__(
         self,
         guidance_embedding_channels: int,
@@ -23,7 +25,12 @@ class GuidanceEncoder(ModelMixin):
         attention_num_heads: int = 8
     ):
         super().__init__()
-        self.guidance_input_channels = guidance_input_channels
+        self.register_to_config(
+            guidance_embedding_channels=guidance_embedding_channels,
+            guidance_input_channels=guidance_input_channels,
+            block_out_channels=block_out_channels,
+            attention_num_heads=attention_num_heads,
+        )
         self.conv_in = InflatedConv3d(
             guidance_input_channels, block_out_channels[0], kernel_size=3, padding=1
         )
@@ -53,9 +60,14 @@ class GuidanceEncoder(ModelMixin):
         
         attention_channel_out = block_out_channels[-1]
         self.guidance_attention = Transformer3DModel(
-            attention_num_heads, attention_channel_out // attention_num_heads, attention_channel_out, norm_num_groups=32,
-            unet_use_cross_frame_attention=False, unet_use_temporal_attention=False)
-        
+            attention_num_heads,
+            attention_channel_out // attention_num_heads,
+            attention_channel_out,
+            norm_num_groups=32,
+            unet_use_cross_frame_attention=False,
+            unet_use_temporal_attention=False
+        )
+
         self.conv_out = zero_module(
             InflatedConv3d(
                 block_out_channels[-1],

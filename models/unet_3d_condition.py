@@ -16,11 +16,10 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import SAFETENSORS_WEIGHTS_NAME, WEIGHTS_NAME, BaseOutput, logging
 from safetensors.torch import load_file
 
-from .resnet import InflatedConv3d, InflatedGroupNorm
-from .unet_3d_blocks import UNetMidBlock3DCrossAttn, get_down_block, get_up_block
+from champ.models.resnet import InflatedConv3d, InflatedGroupNorm
+from champ.models.unet_3d_blocks import UNetMidBlock3DCrossAttn, get_down_block, get_up_block
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
 
 @dataclass
 class UNet3DConditionOutput(BaseOutput):
