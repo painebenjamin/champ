@@ -1,14 +1,24 @@
+from __future__ import annotations
 # Adapted from https://github.com/magic-research/magic-animate/blob/main/magicanimate/pipelines/pipeline_animation.py
-import inspect
+import os
+import gc
+import re
 import math
-from dataclasses import dataclass
+import json
+import torch
+import inspect
+import logging
+import numpy as np
+
 from typing import Callable, List, Optional, Union
 
-import numpy as np
-import torch
 from PIL import Image
+from contextlib import nullcontext
+from dataclasses import dataclass
 
-from diffusers import DiffusionPipeline
+from huggingface_hub import hf_hub_download
+
+from diffusers import DiffusionPipeline, AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import (
     DDIMScheduler,
@@ -18,35 +28,47 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
-from diffusers.utils import BaseOutput, is_accelerate_available
+from diffusers.utils import BaseOutput, is_accelerate_available, is_xformers_available
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from tqdm import tqdm
-from transformers import CLIPImageProcessor
-
+from transformers import (
+    CLIPImageProcessor,
+    CLIPVisionModelWithProjection,
+    CLIPVisionConfig
+)
+from champ.models.unet_2d_condition import UNet2DConditionModel
+from champ.models.unet_3d_condition import UNet3DConditionModel
+from champ.models.guidance_encoder import GuidanceEncoder
 from champ.models.mutual_self_attention import ReferenceAttentionControl
-from champ.pipelines.context import get_context_scheduler
-from champ.pipelines.pipe_utils import get_tensor_interpolation_method
 
+from champ.utils.context_utils import get_context_scheduler
+from champ.utils.pipeline_utils import get_tensor_interpolation_method
+from champ.utils.ckpt_utils import iterate_state_dict
+
+if is_accelerate_available():
+    from accelerate import init_empty_weights
+    from accelerate.utils import set_module_tensor_to_device
+
+logger = logging.getLogger(__name__)
 
 @dataclass
-class MultiGuidance2VideoPipelineOutput(BaseOutput):
+class CHAMPPipelineOutput(BaseOutput):
     videos: Union[torch.Tensor, np.ndarray]
 
-
-class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
+class CHAMPPipeline(DiffusionPipeline):
     _optional_components = []
 
     def __init__(
         self,
-        vae,
-        image_encoder,
-        reference_unet,
-        denoising_unet,
-        guidance_encoder_depth,
-        guidance_encoder_normal,
-        guidance_encoder_semantic_map,
-        guidance_encoder_dwpose,
+        vae: AutoencoderKL,
+        image_encoder: CLIPVisionModelWithProjection,
+        reference_unet: UNet2DConditionModel,
+        denoising_unet: UNet3DConditionModel,
+        guidance_encoder_depth: Optional[GuidanceEncoder],
+        guidance_encoder_normal: Optional[GuidanceEncoder],
+        guidance_encoder_semantic_map: Optional[GuidanceEncoder],
+        guidance_encoder_dwpose: Optional[GuidanceEncoder],
         scheduler: Union[
             DDIMScheduler,
             PNDMScheduler,
@@ -54,10 +76,7 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
             EulerDiscreteScheduler,
             EulerAncestralDiscreteScheduler,
             DPMSolverMultistepScheduler,
-        ],
-        image_proj_model=None,
-        tokenizer=None,
-        text_encoder=None,
+        ]
     ):
         super().__init__()
 
@@ -71,9 +90,6 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
             guidance_encoder_semantic_map=guidance_encoder_semantic_map,
             guidance_encoder_dwpose=guidance_encoder_dwpose,
             scheduler=scheduler,
-            image_proj_model=image_proj_model,
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.clip_image_processor = CLIPImageProcessor()
@@ -85,6 +101,188 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
             do_convert_rgb=True,
             do_normalize=False,
         )
+
+    @classmethod
+    def from_single_file(
+        cls,
+        file_path_or_repository: str,
+        filename: str="champ.safetensors",
+        config_filename: str="config.json",
+        variant: Optional[str]=None,
+        subfolder: Optional[str]=None,
+        device: Optional[Union[str, torch.device]]=None,
+        torch_dtype: Optional[torch.dtype]=None,
+        cache_dir: Optional[str]=None,
+        use_depth_guidance: bool=True,
+        use_normal_guidance: bool=True,
+        use_semantic_map_guidance: bool=True,
+        use_dwpose_guidance: bool=True,
+    ) -> CHAMPPipeline:
+        """
+        Load a CHAMP pipeline from a single file.
+        """
+        if variant is not None:
+            filename, ext = os.path.splitext(filename)
+            filename = f"{filename}.{variant}{ext}"
+
+        if device is None:
+            device = "cpu"
+        else:
+            device = str(device)
+
+        if os.path.isdir(file_path_or_repository):
+            model_dir = file_path_or_repository
+            if subfolder:
+                model_dir = os.path.join(model_dir, subfolder)
+            file_path = os.path.join(model_dir, filename)
+            config_path = os.path.join(model_dir, config_filename)
+        elif os.path.isfile(file_path_or_repository):
+            file_path = file_path_or_repository
+            if os.path.isfile(config_filename):
+                config_path = config_filename
+            else:
+                config_path = os.path.join(os.path.dirname(file_path), config_filename)
+                if not os.path.exists(config_path) and subfolder:
+                    config_path = os.path.join(os.path.dirname(file_path), subfolder, config_filename)
+        elif re.search(r"^[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+$", file_path_or_repository):
+            file_path = hf_hub_download(
+                file_path_or_repository,
+                filename,
+                subfolder=subfolder,
+                cache_dir=cache_dir,
+            )
+            try:
+                config_path = hf_hub_download(
+                    file_path_or_repository,
+                    config_filename,
+                    subfolder=subfolder,
+                    cache_dir=cache_dir,
+                )
+            except:
+                config_path = hf_hub_download(
+                    file_path_or_repository,
+                    config_filename,
+                    cache_dir=cache_dir,
+                )
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File {file_path} not found.")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"File {config_path} not found.")
+
+        with open(config_path, "r") as f:
+            champ_config = json.load(f)
+
+        # Create the scheduler
+        scheduler = DDIMScheduler(**champ_config["scheduler"])
+
+        # Create the models
+        with (init_empty_weights() if is_accelerate_available() else nullcontext()):
+            # UNets
+            reference_unet = UNet2DConditionModel.from_config(champ_config["reference_unet"])
+            denoising_unet = UNet3DConditionModel.from_config(champ_config["denoising_unet"])
+
+            # VAE
+            vae = AutoencoderKL.from_config(champ_config["vae"])
+
+            # Image encoder
+            image_encoder = CLIPVisionModelWithProjection(CLIPVisionConfig(**champ_config["image_encoder"]))
+
+            # Guidance encoders
+            if use_depth_guidance:
+                guidance_encoder_depth = GuidanceEncoder(**champ_config["guidance_encoder"])
+            else:
+                guidance_encoder_depth = None
+
+            if use_normal_guidance:
+                guidance_encoder_normal = GuidanceEncoder(**champ_config["guidance_encoder"])
+            else:
+                guidance_encoder_normal = None
+
+            if use_semantic_map_guidance:
+                guidance_encoder_semantic_map = GuidanceEncoder(**champ_config["guidance_encoder"])
+            else:
+                guidance_encoder_semantic_map = None
+
+            if use_dwpose_guidance:
+                guidance_encoder_dwpose = GuidanceEncoder(**champ_config["guidance_encoder"])
+            else:
+                guidance_encoder_dwpose = None
+
+        # Load the weights
+        logger.debug("Models created, loading weights...")
+        state_dicts = {}
+        for key, value in iterate_state_dict(file_path):
+            try:
+                module, _, key = key.partition(".")
+                if is_accelerate_available():
+                    if module == "reference_unet":
+                        set_module_tensor_to_device(reference_unet, key, device=device, value=value)
+                    elif module == "denoising_unet":
+                        set_module_tensor_to_device(denoising_unet, key, device=device, value=value)
+                    elif module == "vae":
+                        set_module_tensor_to_device(vae, key, device=device, value=value)
+                    elif module == "image_encoder":
+                        set_module_tensor_to_device(image_encoder, key, device=device, value=value)
+                    elif module == "guidance_encoder_depth" and guidance_encoder_depth is not None:
+                        set_module_tensor_to_device(guidance_encoder_depth, key, device=device, value=value)
+                    elif module == "guidance_encoder_normal" and guidance_encoder_normal is not None:
+                        set_module_tensor_to_device(guidance_encoder_normal, key, device=device, value=value)
+                    elif module == "guidance_encoder_semantic_map" and guidance_encoder_semantic_map is not None:
+                        set_module_tensor_to_device(guidance_encoder_semantic_map, key, device=device, value=value)
+                    elif module == "guidance_encoder_dwpose" and guidance_encoder_dwpose is not None:
+                        set_module_tensor_to_device(guidance_encoder_dwpose, key, device=device, value=value)
+                    else:
+                        raise ValueError(f"Unknown module: {module}")
+                else:
+                    if module not in state_dicts:
+                        state_dicts[module] = {}
+                    state_dicts[module][key] = value
+            except (AttributeError, KeyError, ValueError) as ex:
+                logger.warning(f"Skipping module {module} key {key} due to {type(ex)}: {ex}")
+        if not is_accelerate_available():
+            try:
+                reference_unet.load_state_dict(state_dicts["reference_unet"])
+                denoising_unet.load_state_dict(state_dicts["denoising_unet"])
+                vae.load_state_dict(state_dicts["vae"])
+                image_encoder.load_state_dict(state_dicts["image_encoder"], strict=False)
+                if guidance_encoder_depth is not None:
+                    guidance_encoder_depth.load_state_dict(state_dicts["guidance_encoder_depth"])
+                if guidance_encoder_normal is not None:
+                    guidance_encoder_normal.load_state_dict(state_dicts["guidance_encoder_normal"])
+                if guidance_encoder_semantic_map is not None:
+                    guidance_encoder_semantic_map.load_state_dict(state_dicts["guidance_encoder_semantic_map"])
+                if guidance_encoder_dwpose is not None:
+                    guidance_encoder_dwpose.load_state_dict(state_dicts["guidance_encoder_dwpose"])
+                del state_dicts
+                gc.collect()
+            except KeyError as ex:
+                raise RuntimeError(f"File did not provide a state dict for {ex}")
+
+        # Create the pipeline
+        pipeline = cls(
+            vae=vae,
+            image_encoder=image_encoder,
+            reference_unet=reference_unet,
+            denoising_unet=denoising_unet,
+            guidance_encoder_depth=guidance_encoder_depth,
+            guidance_encoder_normal=guidance_encoder_normal,
+            guidance_encoder_semantic_map=guidance_encoder_semantic_map,
+            guidance_encoder_dwpose=guidance_encoder_dwpose,
+            scheduler=scheduler,
+        )
+
+        if torch_dtype is not None:
+            pipeline.to(torch_dtype)
+
+        pipeline.to(device)
+
+        if is_xformers_available():
+            reference_unet.enable_xformers_memory_efficient_attention()
+            denoising_unet.enable_xformers_memory_efficient_attention()
+        else:
+            logger.warning("XFormers is not available, falling back to PyTorch attention")
+        return pipeline
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -100,7 +298,7 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
 
         device = torch.device(f"cuda:{gpu_id}")
 
-        for cpu_offloaded_model in [self.unet, self.text_encoder, self.vae]:
+        for cpu_offloaded_model in [self.denoising_unet, self.reference_unet, self.vae, self.image_encoder, self.guidance_encoder_depth, self.guidance_encoder_normal, self.guidance_encoder_semantic_map, self.guidance_encoder_dwpose]:
             if cpu_offloaded_model is not None:
                 cpu_offload(cpu_offloaded_model, device)
 
@@ -188,114 +386,6 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
         return latents
-
-    def _encode_prompt(
-        self,
-        prompt,
-        device,
-        num_videos_per_prompt,
-        do_classifier_free_guidance,
-        negative_prompt,
-    ):
-        batch_size = len(prompt) if isinstance(prompt, list) else 1
-
-        text_inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        text_input_ids = text_inputs.input_ids
-        untruncated_ids = self.tokenizer(
-            prompt, padding="longest", return_tensors="pt"
-        ).input_ids
-
-        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
-            text_input_ids, untruncated_ids
-        ):
-            removed_text = self.tokenizer.batch_decode(
-                untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
-            )
-
-        if (
-            hasattr(self.text_encoder.config, "use_attention_mask")
-            and self.text_encoder.config.use_attention_mask
-        ):
-            attention_mask = text_inputs.attention_mask.to(device)
-        else:
-            attention_mask = None
-
-        text_embeddings = self.text_encoder(
-            text_input_ids.to(device),
-            attention_mask=attention_mask,
-        )
-        text_embeddings = text_embeddings[0]
-
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
-        bs_embed, seq_len, _ = text_embeddings.shape
-        text_embeddings = text_embeddings.repeat(1, num_videos_per_prompt, 1)
-        text_embeddings = text_embeddings.view(
-            bs_embed * num_videos_per_prompt, seq_len, -1
-        )
-
-        # get unconditional embeddings for classifier free guidance
-        if do_classifier_free_guidance:
-            uncond_tokens: List[str]
-            if negative_prompt is None:
-                uncond_tokens = [""] * batch_size
-            elif type(prompt) is not type(negative_prompt):
-                raise TypeError(
-                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                    f" {type(prompt)}."
-                )
-            elif isinstance(negative_prompt, str):
-                uncond_tokens = [negative_prompt]
-            elif batch_size != len(negative_prompt):
-                raise ValueError(
-                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                    " the batch size of `prompt`."
-                )
-            else:
-                uncond_tokens = negative_prompt
-
-            max_length = text_input_ids.shape[-1]
-            uncond_input = self.tokenizer(
-                uncond_tokens,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-
-            if (
-                hasattr(self.text_encoder.config, "use_attention_mask")
-                and self.text_encoder.config.use_attention_mask
-            ):
-                attention_mask = uncond_input.attention_mask.to(device)
-            else:
-                attention_mask = None
-
-            uncond_embeddings = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                attention_mask=attention_mask,
-            )
-            uncond_embeddings = uncond_embeddings[0]
-
-            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
-            seq_len = uncond_embeddings.shape[1]
-            uncond_embeddings = uncond_embeddings.repeat(1, num_videos_per_prompt, 1)
-            uncond_embeddings = uncond_embeddings.view(
-                batch_size * num_videos_per_prompt, seq_len, -1
-            )
-
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-
-        return text_embeddings
 
     def interpolate_latents(
         self, latents: torch.Tensor, interpolation_factor: int, device
@@ -621,4 +711,4 @@ class MultiGuidance2LongVideoPipeline(DiffusionPipeline):
         if not return_dict:
             return images
 
-        return MultiGuidance2VideoPipelineOutput(videos=images)
+        return CHAMPPipelineOutput(videos=images)

@@ -1,14 +1,22 @@
 import os
 import numpy as np
 import torch
+import imageio
 import torchvision
 import torch.nn.functional as F
-from PIL import Image
-from pathlib import Path
-import imageio
-from einops import rearrange
 import torchvision.transforms as transforms
 
+from PIL import Image
+from pathlib import Path
+from einops import rearrange
+
+def get_pil_from_video(video_path):
+    """
+    Load a video from a file path and return a list of PIL images.
+    """
+    video = imageio.get_reader(video_path)
+    pil_images = [Image.fromarray(frame) for frame in video]
+    return pil_images
 
 def save_videos_from_pil(pil_images, path, fps=24, crf=23):
 
