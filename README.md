@@ -36,64 +36,45 @@ https://github.com/fudan-generative-vision/champ/assets/82803297/b4571be6-dfb0-4
 
 Create conda environment: 
 ```bash
-  conda create -n champ python=3.10
-  conda activate champ
+conda create -n champ python=3.10
+conda activate champ
 ```
 Install packages with `pip`:
 ```bash
-  pip install -r requirements.txt
-```
-
-# Download pretrained models
-
-1. Download pretrained weight of base models: 
-    - [StableDiffusion V1.5](https://huggingface.co/runwayml/stable-diffusion-v1-5)
-    - [sd-vae-ft-mse](https://huggingface.co/stabilityai/sd-vae-ft-mse)
-    - [image_encoder](https://huggingface.co/lambdalabs/sd-image-variations-diffusers/tree/main/image_encoder)
-
-2. Download our checkpoints: \
-Our [checkpoints](https://huggingface.co/fudan-generative-ai/champ/tree/main) consist of denoising UNet, guidance encoders, Reference UNet, and motion module.
-
-Finally, these pretrained models should be organized as follows:
-
-```text
-./pretrained_models/
-|-- champ
-|   |-- denoising_unet.pth
-|   |-- guidance_encoder_depth.pth
-|   |-- guidance_encoder_dwpose.pth
-|   |-- guidance_encoder_normal.pth
-|   |-- guidance_encoder_semantic_map.pth
-|   |-- reference_unet.pth
-|   `-- motion_module.pth
-|-- image_encoder
-|   |-- config.json
-|   `-- pytorch_model.bin
-|-- sd-vae-ft-mse
-|   |-- config.json
-|   |-- diffusion_pytorch_model.bin
-|   `-- diffusion_pytorch_model.safetensors
-`-- stable-diffusion-v1-5
-    |-- feature_extractor
-    |   `-- preprocessor_config.json
-    |-- model_index.json
-    |-- unet
-    |   |-- config.json
-    |   `-- diffusion_pytorch_model.bin
-    `-- v1-inference.yaml
+pip install git+https://github.com/painebenjamin/champ.git
 ```
 
 # Inference
-We have provided several sets of [example data](https://huggingface.co/fudan-generative-ai/champ/tree/main) for inference. Please first download and place them in the `example_data` folder. 
-Here is the command for inference:
-```bash
-  python inference.py --config configs/inference.yaml
+To inference, simply instantiate the pipeline and pass your arguments.
+
+```py
+from champ import CHAMPPipeline
+
+pipeline = CHAMPPipeline.from_pretrained(
+  "benjamin-paine/champ",
+  torch_dtype=torch.float16,
+  variant="fp16",
+  device="cuda"
+).to("cuda", dtype=torch.float16)
+
+result = pipeline(
+  reference: PIL.Image.Image,
+  guidance: Dict[str, List[PIL.Image.Image]],
+  width: int,
+  height: int,
+  video_length: int,
+  num_inference_steps: int,
+  guidance_scale: float
+).videos
+# Result is a list of PIL Images
 ```
-Animation results will be saved in `results` folder. You can change the reference image or the guidance motion by modifying `inference.yaml`. 
 
-You can also extract the driving motion from any videos and then render with Blender. We will later provide the instructions and scripts for this.
-
-Note: The default motion-01 in `inference.yaml` has more than 500 frames and takes about 36GB VRAM. If you encounter VRAM issues, consider switching to other example data with less frames.
+# Example
+One small set of example data is provided in this repository, with a script to execute. Here is the command for inference:
+```bash
+python inference.py
+```
+Animation results will be saved as `output.mp4`.
 
 # Acknowledgements
 We thank the authors of [MagicAnimate](https://github.com/magic-research/magic-animate), [Animate Anyone](https://github.com/HumanAIGC/AnimateAnyone), and [AnimateDiff](https://github.com/guoyww/AnimateDiff) for their excellent work. Our project is built upon [Moore-AnimateAnyone](https://github.com/MooreThreads/Moore-AnimateAnyone), and we are grateful for their open-source contributions.
